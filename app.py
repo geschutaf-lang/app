@@ -9,18 +9,28 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="코스피 볼린저 밴드 스캐너", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="기간별 볼린저 밴드 돌파 스캐너", page_icon="📅", layout="wide")
 
-st.title("🔍 코스피 볼린저 밴드 상단 돌파 스캐너")
+st.title("📅 기간별 코스피 볼린저 밴드 상단 돌파 탐색기")
 st.markdown("""
-코스피 종목의 일봉 데이터를 분석하여 **볼린저 밴드(20, 2) 상단선을 돌파한 종목**을 실시간으로 탐색합니다.
-* **당일 돌파:** 전일에는 상단선 아래에 있다가 당일 갓 상단을 뚫고 올라온 종목 (골든크로스)
-* **상단 초과 유지:** 현재 종가가 상한선 위에 위치하고 있는 모든 종목
+설정한 **시작일 ~ 종료일** 기간 동안 일자별로 **볼린저 밴드(20, 2) 상단선을 갓 돌파한 종목(골든크로스)**을 탐색합니다.
+* **돌파 조건:** 전일 종가 $\le$ 전일 상한선 AND 당일 종가 $>$ 당일 상한선
 """)
 
 # ── 사이드바 설정 ──
 with st.sidebar:
-    st.header("⚙️ 스캔 옵션")
+    st.header("⚙️ 분석 조건 설정")
+    
+    # 분석 기간 선택 (기본값 설정)
+    default_end = datetime(2026, 1, 7).date() if datetime.today().year >= 2026 else datetime.today().date()
+    default_start = datetime(2026, 1, 3).date() if datetime.today().year >= 2026 else (default_end - timedelta(days=7))
+    
+    date_range = st.date_input(
+        "분석 기간 선택",
+        value=(default_start, default_end),
+        max_value=datetime.today().date()
+    )
+    
     scan_scope = st.selectbox(
         "스캔 대상 범위",
         ["시가총액 상위 50종목 (초고속)", "시가총액 상위 100종목 (빠름)", "시가총액 상위 200종목 (권장)"]
@@ -29,9 +39,9 @@ with st.sidebar:
     period = st.number_input("볼린저 밴드 기간 (기본: 20)", min_value=5, max_value=60, value=20)
     dev_multiplier = st.number_input("표준편차 배수 (기본: 2.0)", min_value=1.0, max_value=3.0, value=2.0, step=0.1)
     
-    run_btn = st.button("🚀 종목 스캔 시작", type="primary", use_container_width=True)
+    run_btn = st.button("🚀 기간별 스캔 시작", type="primary", use_container_width=True)
 
-# ── 1. 네이버 금융에서 코스피 시총 상위 종목 수집 (해외 IP 차단 우회) ──
+# ── 1. 네이버 금융 시가총액 상위 수집 ──
 @st.cache_data(ttl=3600)
 def get_kospi_top_list(target_count):
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -49,7 +59,6 @@ def get_kospi_top_list(target_count):
             
         for a in table.find_all('a', {'class': 'tltle'}):
             name = a.text.strip()
-            # 우선주 제외
             if name.endswith(('우', '우B', '우C')):
                 continue
             code = a['href'].split('code=')[-1]
@@ -62,15 +71,16 @@ def get_kospi_top_list(target_count):
             
     return pd.DataFrame(stocks)
 
-# ── 2. 볼린저 밴드 스캔 함수 ──
-def scan_bollinger_breakout(df_target, period, dev):
-    start_date = (datetime.today() - timedelta(days=120)).strftime('%Y-%m-%d')
+# ── 2. 기간별 볼린저 밴드 돌파 탐색 함수 ──
+def scan_period_breakout(df_target, start_dt, end_dt, period, dev):
+    # 20일 이동평균 계산을 위해 시작일보다 90일 전부터 데이터 조회
+    fetch_start = (start_dt - timedelta(days=90)).strftime('%Y-%m-%d')
+    fetch_end = (end_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+    
     total = len(df_target)
+    all_breakouts = []
     
-    breakout_list = []      # 당일 갓 돌파
-    above_band_list = []    # 상한선 위에 위치
-    
-    prog_bar = st.progress(0, text="종목 데이터 수집 및 계산 시작...")
+    prog_bar = st.progress(0, text="데이터 수집 및 기간별 계산 시작...")
     
     for i, (_, row) in enumerate(df_target.iterrows()):
         ticker = row['Code']
@@ -79,7 +89,7 @@ def scan_bollinger_breakout(df_target, period, dev):
         prog_bar.progress((i + 1) / total, text=f"분석 중 ({i+1}/{total}): {name} ({ticker})")
         
         try:
-            df = fdr.DataReader(ticker, start=start_date)
+            df = fdr.DataReader(ticker, start=fetch_start, end=fetch_end)
             if len(df) < period + 5:
                 continue
                 
@@ -88,36 +98,52 @@ def scan_bollinger_breakout(df_target, period, dev):
             df['STD'] = df['Close'].rolling(window=period).std()
             df['Upper'] = df['MA'] + (df['STD'] * dev)
             
-            prev_close, prev_upper = df['Close'].iloc[-2], df['Upper'].iloc[-2]
-            curr_close, curr_upper = df['Close'].iloc[-1], df['Upper'].iloc[-1]
+            # 사용자 지정 기간 필터링
+            target_mask = (df.index.date >= start_dt) & (df.index.date <= end_dt)
+            target_dates = df.index[target_mask]
             
-            change_rate = ((curr_close / prev_close) - 1) * 100
-            pct_over_upper = ((curr_close / curr_upper) - 1) * 100
-            
-            stock_info = {
-                '종목코드': ticker,
-                '종목명': name,
-                '현재가': f"{int(curr_close):,}원",
-                '상한선': f"{round(curr_upper, 1):,}원",
-                '상한선초과율': f"+{pct_over_upper:.2f}%",
-                '전일대비등락률': f"{change_rate:+.2f}%"
-            }
-            
-            # 상단선 위에 있는 경우
-            if curr_close > curr_upper:
-                above_band_list.append(stock_info)
-                # 당일 갓 돌파한 경우
-                if prev_close <= prev_upper:
-                    breakout_list.append(stock_info)
+            for dt in target_dates:
+                idx_pos = df.index.get_loc(dt)
+                if idx_pos == 0:
+                    continue
+                
+                prev_close = df['Close'].iloc[idx_pos - 1]
+                prev_upper = df['Upper'].iloc[idx_pos - 1]
+                curr_close = df['Close'].iloc[idx_pos]
+                curr_upper = df['Upper'].iloc[idx_pos]
+                
+                # 당일 상향 돌파 조건 체크
+                if prev_close <= prev_upper and curr_close > curr_upper:
+                    change_rate = ((curr_close / prev_close) - 1) * 100
+                    pct_over_upper = ((curr_close / curr_upper) - 1) * 100
                     
+                    all_breakouts.append({
+                        '돌파 날짜': dt.strftime('%Y-%m-%d'),
+                        '종목코드': ticker,
+                        '종목명': name,
+                        '당일 종가': f"{int(curr_close):,}원",
+                        '상한선': f"{round(curr_upper, 1):,}원",
+                        '상한선 초과율': f"+{pct_over_upper:.2f}%",
+                        '당일 등락률': f"{change_rate:+.2f}%"
+                    })
         except Exception:
             continue
             
     prog_bar.empty()
-    return pd.DataFrame(breakout_list), pd.DataFrame(above_band_list)
+    return pd.DataFrame(all_breakouts)
 
-# ── 3. 실행 UI ──
+# ── 3. 실행 및 결과 표시 ──
 if run_btn:
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        st.error("시작일과 종료일을 모두 선택해 주세요.")
+        st.stop()
+        
+    if start_date > end_date:
+        st.error("시작일은 종료일보다 이전이어야 합니다.")
+        st.stop()
+
     count_map = {
         "시가총액 상위 50종목 (초고속)": 50,
         "시가총액 상위 100종목 (빠름)": 100,
@@ -125,30 +151,34 @@ if run_btn:
     }
     target_count = count_map.get(scan_scope, 100)
     
-    with st.spinner("코스피 시가총액 상위 종목 목록을 수집 중입니다..."):
+    with st.spinner("코스피 종목 목록 수집 중..."):
         target_df = get_kospi_top_list(target_count)
         
-    st.info(f"총 **{len(target_df)}개** 종목을 대상으로 볼린저 밴드 분석을 시작합니다.")
-    df_breakout, df_above = scan_bollinger_breakout(target_df, period, dev_multiplier)
+    st.info(f"분석 대상: **{len(target_df)}개 종목** | 분석 기간: **{start_date} ~ {end_date}**")
+    df_results = scan_period_breakout(target_df, start_date, end_date, period, dev_multiplier)
     
+    # ── 결과 요약 메트릭 ──
     st.subheader("📊 스캔 결과 요약")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("총 분석 종목", f"{len(target_df)}개")
-    col2.metric("당일 갓 상향돌파 종목", f"{len(df_breakout)}개")
-    col3.metric("상한선 초과 종목 (전체)", f"{len(df_above)}개")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("분석 기간", f"{(end_date - start_date).days + 1}일간")
+    c2.metric("총 돌파 이벤트 건수", f"{len(df_results)}건")
+    c3.metric("돌파 종목 수 (중복 제외)", f"{df_results['종목코드'].nunique() if not df_results.empty else 0}개")
     
-    tab1, tab2 = st.tabs(["🚀 당일 갓 상향돌파 종목", "📈 상한선 초과 유지 종목"])
-    
-    with tab1:
-        st.caption("어제까지 상한선 밑에 머물다가 오늘 밴드 상단을 뚫고 올라온 종목입니다.")
-        if not df_breakout.empty:
-            st.dataframe(df_breakout.reset_index(drop=True), use_container_width=True)
-        else:
-            st.warning("조건을 만족하는 당일 돌파 종목이 없습니다.")
-            
-    with tab2:
-        st.caption("현재 종가가 볼린저 밴드 상한선보다 위에 위치해 있는 모든 종목입니다.")
-        if not df_above.empty:
-            st.dataframe(df_above.reset_index(drop=True), use_container_width=True)
-        else:
-            st.warning("상한선 위에 위치한 종목이 없습니다.")
+    if not df_results.empty:
+        # 날짜 내림차순 정렬
+        df_results = df_results.sort_values(by=['돌파 날짜', '종목명'], ascending=[False, True]).reset_index(drop=True)
+        
+        # 탭 분리: 날짜별 모아보기 & 전체 목록 테이블
+        tab1, tab2 = st.tabs(["📅 날짜별 그룹 보기", "📋 전체 목록 테이블"])
+        
+        with tab1:
+            unique_dates = df_results['돌파 날짜'].unique()
+            for d in sorted(unique_dates, reverse=True):
+                sub_df = df_results[df_results['돌파 날짜'] == d].drop(columns=['돌파 날짜']).reset_index(drop=True)
+                with st.expander(f"📌 **{d}** 상단 돌파 종목 ({len(sub_df)}개)", expanded=True):
+                    st.dataframe(sub_df, use_container_width=True)
+                    
+        with tab2:
+            st.dataframe(df_results, use_container_width=True)
+    else:
+        st.warning(f"선택하신 기간 ({start_date} ~ {end_date}) 동안 볼린저 밴드 상단을 돌파한 종목이 없습니다.")
