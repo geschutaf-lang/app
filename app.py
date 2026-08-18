@@ -2,6 +2,8 @@ import streamlit as st
 import FinanceDataReader as fdr
 import pandas as pd
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import warnings
 
@@ -21,7 +23,7 @@ with st.sidebar:
     st.header("⚙️ 스캔 옵션")
     scan_scope = st.selectbox(
         "스캔 대상 범위",
-        ["시가총액 상위 100종목 (빠름)", "시가총액 상위 200종목 (권장)", "코스피 전체 종목 (약 2~3분 소요)"]
+        ["시가총액 상위 50종목 (초고속)", "시가총액 상위 100종목 (빠름)", "시가총액 상위 200종목 (권장)"]
     )
     
     period = st.number_input("볼린저 밴드 기간 (기본: 20)", min_value=5, max_value=60, value=20)
@@ -29,7 +31,38 @@ with st.sidebar:
     
     run_btn = st.button("🚀 종목 스캔 시작", type="primary", use_container_width=True)
 
-# ── 볼린저 밴드 스캔 함수 ──
+# ── 1. 네이버 금융에서 코스피 시총 상위 종목 수집 (해외 IP 차단 우회) ──
+@st.cache_data(ttl=3600)
+def get_kospi_top_list(target_count):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    stocks = []
+    
+    pages = (target_count // 50) + 1
+    for page in range(1, pages + 1):
+        url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page={page}"
+        res = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        table = soup.find('table', {'class': 'type_2'})
+        if not table:
+            continue
+            
+        for a in table.find_all('a', {'class': 'tltle'}):
+            name = a.text.strip()
+            # 우선주 제외
+            if name.endswith(('우', '우B', '우C')):
+                continue
+            code = a['href'].split('code=')[-1]
+            stocks.append({'Code': code, 'Name': name})
+            
+            if len(stocks) >= target_count:
+                break
+        if len(stocks) >= target_count:
+            break
+            
+    return pd.DataFrame(stocks)
+
+# ── 2. 볼린저 밴드 스캔 함수 ──
 def scan_bollinger_breakout(df_target, period, dev):
     start_date = (datetime.today() - timedelta(days=120)).strftime('%Y-%m-%d')
     total = len(df_target)
@@ -43,7 +76,6 @@ def scan_bollinger_breakout(df_target, period, dev):
         ticker = row['Code']
         name = row['Name']
         
-        # 진행률 업데이트
         prog_bar.progress((i + 1) / total, text=f"분석 중 ({i+1}/{total}): {name} ({ticker})")
         
         try:
@@ -56,28 +88,25 @@ def scan_bollinger_breakout(df_target, period, dev):
             df['STD'] = df['Close'].rolling(window=period).std()
             df['Upper'] = df['MA'] + (df['STD'] * dev)
             
-            # 최근 2개 거래일 종가 및 상한선
             prev_close, prev_upper = df['Close'].iloc[-2], df['Upper'].iloc[-2]
             curr_close, curr_upper = df['Close'].iloc[-1], df['Upper'].iloc[-1]
             
-            # 1일 전 대비 등락률
             change_rate = ((curr_close / prev_close) - 1) * 100
             pct_over_upper = ((curr_close / curr_upper) - 1) * 100
             
             stock_info = {
                 '종목코드': ticker,
                 '종목명': name,
-                '현재가': int(curr_close),
-                '상한선': round(curr_upper, 1),
+                '현재가': f"{int(curr_close):,}원",
+                '상한선': f"{round(curr_upper, 1):,}원",
                 '상한선초과율': f"+{pct_over_upper:.2f}%",
                 '전일대비등락률': f"{change_rate:+.2f}%"
             }
             
-            # 상단 위에 있는 종목
+            # 상단선 위에 있는 경우
             if curr_close > curr_upper:
                 above_band_list.append(stock_info)
-                
-                # 어제는 상단 아래였으나 오늘 갓 뚫은 경우
+                # 당일 갓 돌파한 경우
                 if prev_close <= prev_upper:
                     breakout_list.append(stock_info)
                     
@@ -87,39 +116,31 @@ def scan_bollinger_breakout(df_target, period, dev):
     prog_bar.empty()
     return pd.DataFrame(breakout_list), pd.DataFrame(above_band_list)
 
-# ── 실행 로직 ──
+# ── 3. 실행 UI ──
 if run_btn:
-    with st.spinner("코스피 종목 목록을 불러오는 중입니다..."):
-        kospi_df = fdr.StockListing('KOSPI')
-        # 우선주 및 스팩주 제외
-        kospi_df = kospi_df[~kospi_df['Name'].str.endswith(('우', '우B', '우C'))].copy()
+    count_map = {
+        "시가총액 상위 50종목 (초고속)": 50,
+        "시가총액 상위 100종목 (빠름)": 100,
+        "시가총액 상위 200종목 (권장)": 200
+    }
+    target_count = count_map.get(scan_scope, 100)
+    
+    with st.spinner("코스피 시가총액 상위 종목 목록을 수집 중입니다..."):
+        target_df = get_kospi_top_list(target_count)
         
-        # 시가총액 기준 정렬
-        if 'MarCap' in kospi_df.columns:
-            kospi_df = kospi_df.sort_values(by='MarCap', ascending=False)
-            
-        if "100종목" in scan_scope:
-            target_df = kospi_df.head(100)
-        elif "200종목" in scan_scope:
-            target_df = kospi_df.head(200)
-        else:
-            target_df = kospi_df
-            
-    st.info(f"총 **{len(target_df)}개** 종목을 대상으로 분석을 시작합니다.")
+    st.info(f"총 **{len(target_df)}개** 종목을 대상으로 볼린저 밴드 분석을 시작합니다.")
     df_breakout, df_above = scan_bollinger_breakout(target_df, period, dev_multiplier)
     
-    # ── 요약 메트릭 ──
     st.subheader("📊 스캔 결과 요약")
     col1, col2, col3 = st.columns(3)
     col1.metric("총 분석 종목", f"{len(target_df)}개")
     col2.metric("당일 갓 상향돌파 종목", f"{len(df_breakout)}개")
     col3.metric("상한선 초과 종목 (전체)", f"{len(df_above)}개")
     
-    # ── 결과 테이블 ──
     tab1, tab2 = st.tabs(["🚀 당일 갓 상향돌파 종목", "📈 상한선 초과 유지 종목"])
     
     with tab1:
-        st.caption("어제까지 상한선 밑에 머물다가 오늘 거래에서 밴드 상단을 뚫고 올라온 종목입니다.")
+        st.caption("어제까지 상한선 밑에 머물다가 오늘 밴드 상단을 뚫고 올라온 종목입니다.")
         if not df_breakout.empty:
             st.dataframe(df_breakout.reset_index(drop=True), use_container_width=True)
         else:
