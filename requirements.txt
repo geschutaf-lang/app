@@ -2,3 +2,5 @@ streamlit
 finance-datareader
 pandas
 numpy
+beautifulsoup4
+requests
